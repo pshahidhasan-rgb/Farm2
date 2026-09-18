@@ -140,11 +140,17 @@ function getProxyForBot(profile) {
  * @returns {object} { headless, proxy, args }
  */
 function getLaunchConfig(proxyConfig) {
+  const webrtcArgs = [
+    '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+    '--disable-features=WebRtcHideLocalIpsWithMdns',
+  ];
+
   if (proxyConfig.type === 'urban') {
     return {
       headless: false,
       proxy: null,
       args: [
+        ...webrtcArgs,
         `--disable-extensions-except=${proxyConfig.extensionPath}`,
         `--load-extension=${proxyConfig.extensionPath}`,
         '--no-sandbox',
@@ -163,6 +169,7 @@ function getLaunchConfig(proxyConfig) {
       password: proxyConfig.password,
     },
     args: [
+      ...webrtcArgs,
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',

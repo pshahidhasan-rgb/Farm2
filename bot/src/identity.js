@@ -75,6 +75,26 @@ function generateAllProfiles() {
   return profiles;
 }
 
+const TIMEZONE_MAP = {
+  'United States - New York': 'America/New_York',
+  'United States - California': 'America/Los_Angeles',
+  'United States - Texas': 'America/Chicago',
+  'United States - Florida': 'America/New_York',
+  'United States - Illinois': 'America/Chicago',
+  'United Kingdom - London': 'Europe/London',
+  'United Kingdom - Manchester': 'Europe/London',
+};
+
+const LOCALE_MAP = {
+  'United States - New York': 'en-US',
+  'United States - California': 'en-US',
+  'United States - Texas': 'en-US',
+  'United States - Florida': 'en-US',
+  'United States - Illinois': 'en-US',
+  'United Kingdom - London': 'en-GB',
+  'United Kingdom - Manchester': 'en-GB',
+};
+
 /**
  * Get Playwright context options for a profile
  */
@@ -84,8 +104,8 @@ function getContextOptions(profile) {
     viewport: profile.viewport,
     isMobile: profile.viewport.isMobile,
     hasTouch: profile.viewport.hasTouch,
-    locale: 'en-US',
-    timezoneId: 'America/New_York',
+    locale: LOCALE_MAP[profile.vpnRegion] || 'en-US',
+    timezoneId: TIMEZONE_MAP[profile.vpnRegion] || 'America/New_York',
     permissions: ['geolocation'],
     geolocation: profile.vpnRegion.includes('United Kingdom')
       ? { latitude: 51.5074, longitude: -0.1278 }

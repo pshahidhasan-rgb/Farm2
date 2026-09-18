@@ -1,7 +1,9 @@
 // Reactive State Machine Worker v2 — sequential state transitions
 // Each ad cycle follows a strict pipeline: trigger → watch → skip → CTA → cleanup → next
 
-const { chromium } = require('playwright');
+const { chromium } = require('playwright-extra');
+const stealth = require('puppeteer-extra-plugin-stealth');
+chromium.use(stealth());
 const { getCanvasNoiseScript } = require('./canvasNoise');
 const { scanDom } = require('./domSniper');
 const { humanClick } = require('./bezierMouse');
@@ -23,6 +25,37 @@ if (PROXY_MODE === 'webshare') {
   }
 }
 
+// ========================
+// Pacing Constants
+// ========================
+const MAX_ADS_PER_HOUR = 6;
+const HOURLY_WINDOW_MS = 3600000;
+const COOLDOWN_MS = 300000;       // 5 min cooldown after any ad
+const MAX_HOURLY_COOLDOWN_MS = 600000; // 10 min forced gameplay after hitting hourly cap
+const CTR_PROBABILITY = 0.3;      // 30% chance to click CTA
+
+/**
+ * Create a fresh pacing state for a session
+ */
+function createPacingState() {
+  return {
+    adsThisHour: 0,
+    hourStart: Date.now(),
+    lastAdTime: 0,
+  };
+}
+
+/**
+ * Reset hourly counter if window has elapsed
+ */
+function checkHourlyReset(state) {
+  const now = Date.now();
+  if (now - state.hourStart > HOURLY_WINDOW_MS) {
+    state.adsThisHour = 0;
+    state.hourStart = now;
+  }
+}
+
 /**
  * Wait until a specific selector is visible, or timeout
  */
@@ -38,10 +71,13 @@ async function waitForVisible(page, selector, timeoutMs) {
 
 /**
  * Run ONE complete ad cycle:
- * 1. Trigger → 2. Wait for skip → 3. Skip → 4. CTA → 5. Cleanup
+ * 1. Trigger → 2. Wait for skip → 3. Skip → 4. CTA (30%) → 5. Cleanup
+ * @param {Page} page
+ * @param {number} botId
+ * @param {object} pacing - pacing state (mutated: lastAdTime, adsThisHour)
  * @returns {boolean} true if ad was consumed
  */
-async function runAdCycle(page, botId) {
+async function runAdCycle(page, botId, pacing) {
   // Step 1: Trigger the ad
   await page.goto(GAME_URL, { waitUntil: 'networkidle', timeout: 20000 }).catch(() => {});
   if (page.isClosed()) return false;
@@ -82,22 +118,21 @@ async function runAdCycle(page, botId) {
   });
   console.log(`[Bot ${botId}] Ad skipped`);
 
-  // Step 4: Wait for CTA overlay and click it
+  // Step 4: CTA — only 30% chance to click (CTR control)
   await page.waitForTimeout(1000 + Math.random() * 500).catch(() => {});
   const ctaVisible = await waitForVisible(page, '#cta-overlay', 5000);
   
-  if (ctaVisible && !page.isClosed()) {
-    console.log(`[Bot ${botId}] CTA appeared`);
-    await page.waitForTimeout(500 + Math.random() * 500).catch(() => {});
+  const shouldClickCta = ctaVisible && !page.isClosed() && Math.random() < CTR_PROBABILITY;
 
+  if (shouldClickCta) {
+    console.log(`[Bot ${botId}] CTA appeared → clicking (30% roll)`);
     const ctaBox = await page.locator('#cta-install-btn').boundingBox().catch(() => null);
     if (ctaBox) {
       await page.click('#cta-install-btn');
-      console.log(`[Bot ${botId}] CTA clicked`);
-
-      // Stay on "advertiser page" for 3-5 seconds
       await page.waitForTimeout(3000 + Math.random() * 2000).catch(() => {});
     }
+  } else if (ctaVisible) {
+    console.log(`[Bot ${botId}] CTA appeared → skipping (70% roll)`);
   } else {
     console.log(`[Bot ${botId}] No CTA appeared`);
   }
@@ -115,14 +150,18 @@ async function runAdCycle(page, botId) {
   await page.goto(GAME_URL, { waitUntil: 'load', timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(500 + Math.random() * 1000).catch(() => {});
 
+  // Update pacing state
+  pacing.lastAdTime = Date.now();
+  pacing.adsThisHour++;
+
   console.log(`[Bot ${botId}] Ad cycle complete`);
   return true;
 }
 
 /**
- * Browse game with random actions (between ad cycles)
+ * Browse game with random actions — runs for at least `minDurationSec` if provided
  */
-async function browseGame(page) {
+async function browseGame(page, minDurationSec) {
   const actions = [
     async () => {
       await page.goto(GAME_URL, { waitUntil: 'load', timeout: 15000 }).catch(() => {});
@@ -140,15 +179,18 @@ async function browseGame(page) {
     },
   ];
 
-  const count = 1 + Math.floor(Math.random() * 2);
-  for (let i = 0; i < count; i++) {
+  const startTime = Date.now();
+  const minDurationMs = (minDurationSec || 0) * 1000;
+
+  do {
     if (page.isClosed()) break;
     const action = actions[Math.floor(Math.random() * actions.length)];
     await action();
     if (!page.isClosed()) {
       try { await page.waitForTimeout(2000 + Math.random() * 5000); } catch { break; }
     }
-  }
+  } while (!page.isClosed() && (Date.now() - startTime) < minDurationMs);
+
   // Return to game dashboard
   if (!page.isClosed()) {
     await page.goto(GAME_URL, { waitUntil: 'networkidle', timeout: 15000 }).catch(() => {});
@@ -179,6 +221,11 @@ async function runSession(profile, state) {
 
   await page.addInitScript(getCanvasNoiseScript(botId));
 
+  // Hide automation flags
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  });
+
   // If Urban VPN mode, connect after browser launch
   if (proxy.type === 'urban') {
     console.log(`[Bot ${botId}] Connecting Urban VPN to ${proxy.label}...`);
@@ -189,6 +236,9 @@ async function runSession(profile, state) {
       console.log(`[Bot ${botId}] VPN error: ${err.message} — continuing without VPN`);
     }
   }
+
+  // Pacing state for this session
+  const pacing = createPacingState();
 
   // Use clicksPerSession from orchestrator state, or env, default to 0 for safety
   const maxAds = (state && state.clicksPerSession !== undefined)
@@ -204,16 +254,36 @@ async function runSession(profile, state) {
     // Initial browse
     await browseGame(page);
 
-    // Sequential ad cycles
+    // Sequential ad cycles with pacing
     for (let round = 0; round < maxAds; round++) {
       if (page.isClosed()) break;
       if (state && state.adsToday >= (state.dailyCap || 20)) break;
 
+      // Hourly cap: max 6 ads per hour
+      checkHourlyReset(pacing);
+      if (pacing.adsThisHour >= MAX_ADS_PER_HOUR) {
+        const forcedWaitSec = MAX_HOURLY_COOLDOWN_MS / 1000;
+        console.log(`[Bot ${botId}] Hourly cap (${MAX_ADS_PER_HOUR}) reached. Playing ${forcedWaitSec}s organically...`);
+        await browseGame(page, forcedWaitSec);
+        pacing.adsThisHour = 0;
+        pacing.hourStart = Date.now();
+        // Re-check daily cap after long break
+        if (state && state.adsToday >= (state.dailyCap || 20)) break;
+      }
+
+      // Cooldown: 5 min minimum between ads
+      const elapsedSinceLastAd = Date.now() - pacing.lastAdTime;
+      if (pacing.lastAdTime > 0 && elapsedSinceLastAd < COOLDOWN_MS) {
+        const remainingSec = Math.ceil((COOLDOWN_MS - elapsedSinceLastAd) / 1000);
+        console.log(`[Bot ${botId}] Cooldown: playing ${remainingSec}s before next ad...`);
+        await browseGame(page, remainingSec);
+      }
+
       console.log(`[Bot ${botId}] --- Ad cycle ${round + 1}/${maxAds} ---`);
-      const consumed = await runAdCycle(page, botId);
+      const consumed = await runAdCycle(page, botId, pacing);
       if (consumed) adsConsumed++;
 
-      // Browse between cycles
+      // Browse between cycles (cooldown starts automatically from pacing.lastAdTime)
       if (round < maxAds - 1 && !page.isClosed()) {
         await browseGame(page);
       }
